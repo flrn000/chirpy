@@ -1,8 +1,23 @@
 package server
 
-import "net/http"
+import (
+	"fmt"
+	"log"
+	"net/http"
+)
 
 const Port = "8080"
+const root = "."
 
 var mux = http.NewServeMux()
-var S = http.Server{Handler: mux, Addr: ":" + Port}
+var Srv = &http.Server{
+	Handler: mux,
+	Addr:    ":" + Port,
+}
+
+func Initialize() {
+	mux.Handle("/", http.FileServer(http.Dir(root)))
+
+	fmt.Println("Serving on port: ", Port)
+	log.Fatal(Srv.ListenAndServe())
+}
