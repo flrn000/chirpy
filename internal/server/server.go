@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 type apiConfig struct {
@@ -13,6 +15,11 @@ type apiConfig struct {
 
 type requestBody struct {
 	Body *string `json:"body"`
+}
+
+type user struct {
+	email    string
+	password []byte
 }
 
 const Port = "8080"
@@ -24,6 +31,7 @@ var Srv = &http.Server{
 	Handler: mux,
 	Addr:    ":" + Port,
 }
+var tempDB = make(map[string]user)
 
 func Initialize() {
 	cfg := apiConfig{fileServerHits: 0}
@@ -36,6 +44,13 @@ func Initialize() {
 	mux.HandleFunc("GET /admin/metrics", cfg.handleMetrics)
 	mux.HandleFunc("GET /api/reset", cfg.resetMetrics)
 	mux.HandleFunc("POST /api/validate_chirp", validateChirp)
+	mux.HandleFunc("GET /api/{id}/test/", func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		log.Printf("id is: %v", id)
+		w.Write([]byte(fmt.Sprintf("id: is %v", id)))
+	})
+	mux.HandleFunc("POST /api/users", users)
+	mux.HandleFunc("POST /api/login", login)
 
 	fmt.Println("Serving on port: ", Port)
 	log.Fatal(Srv.ListenAndServe())
@@ -101,5 +116,88 @@ func validateChirp(w http.ResponseWriter, r *http.Request) {
 
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(resp)
+	}
+}
+
+func users(w http.ResponseWriter, r *http.Request) {
+	type requestBody struct {
+		Password string `json:"password"`
+		Email    string `json:"email"`
+	}
+	type response struct {
+		ID    int    `json:"id"`
+		Email string `json:"email"`
+	}
+	var userInfo requestBody
+
+	err := json.NewDecoder(r.Body).Decode(&userInfo)
+	if err != nil {
+		log.Printf("Error decoding request body: %v", err)
+		w.WriteHeader(500)
+		return
+	}
+
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(userInfo.Password), 15)
+	if err != nil {
+		log.Printf("Error could not encrypt password: %v", err)
+		w.WriteHeader(500)
+		return
+	}
+
+	if _, exists := tempDB[userInfo.Email]; !exists {
+		tempDB[userInfo.Email] = user{email: userInfo.Email, password: hashedPassword}
+
+		resp, err := json.Marshal(response{ID: 1, Email: userInfo.Email})
+		if err != nil {
+			log.Printf("Error marshalling JSON: %s", err)
+			w.WriteHeader(500)
+			return
+		}
+
+		w.WriteHeader(http.StatusCreated)
+		w.Write(resp)
+	} else {
+		w.WriteHeader(http.StatusConflict)
+		w.Write([]byte(fmt.Sprintf("Error user with email: %v already exists", userInfo.Email)))
+	}
+}
+
+func login(w http.ResponseWriter, r *http.Request) {
+	type requestBody struct {
+		Password string `json:"password"`
+		Email    string `json:"email"`
+	}
+	type response struct {
+		ID    int    `json:"id"`
+		Email string `json:"email"`
+	}
+	var userInfo requestBody
+
+	err := json.NewDecoder(r.Body).Decode(&userInfo)
+	if err != nil {
+		log.Printf("Error decoding request body: %v", err)
+		w.WriteHeader(500)
+		return
+	}
+
+	if dbUser, exists := tempDB[userInfo.Email]; exists {
+		err := bcrypt.CompareHashAndPassword(dbUser.password, []byte(userInfo.Password))
+		if err != nil {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+
+		resp, err := json.Marshal(response{ID: 1, Email: dbUser.email})
+		if err != nil {
+			log.Printf("Error marshalling response: %v", err)
+			w.WriteHeader(500)
+			return
+		}
+
+		w.Write(resp)
+
+	} else {
+		w.WriteHeader(http.StatusNoContent)
+		w.Write([]byte(fmt.Sprintf("No user found with the email: %s", userInfo.Email)))
 	}
 }
