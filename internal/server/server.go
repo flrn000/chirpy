@@ -1,6 +1,8 @@
 package server
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -22,9 +24,11 @@ type requestBody struct {
 }
 
 type user struct {
-	id       int
-	email    string
-	password []byte
+	id             int
+	email          string
+	password       []byte
+	refreshToken   string
+	tokenExpiresAt time.Time
 }
 
 const Port = "8080"
@@ -172,14 +176,14 @@ func users(w http.ResponseWriter, r *http.Request) {
 
 func (cfg *apiConfig) login(w http.ResponseWriter, r *http.Request) {
 	type requestBody struct {
-		Password         string `json:"password"`
-		Email            string `json:"email"`
-		ExpiresInSeconds int    `json:"expires_in_seconds"`
+		Password string `json:"password"`
+		Email    string `json:"email"`
 	}
 	type response struct {
-		ID    int    `json:"id"`
-		Email string `json:"email"`
-		Token string `json:"token"`
+		ID           int    `json:"id"`
+		Email        string `json:"email"`
+		Token        string `json:"token"`
+		RefreshToken string `json:"refresh_token"`
 	}
 	var userInfo requestBody
 
@@ -196,19 +200,13 @@ func (cfg *apiConfig) login(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		expirationTime := time.Now().Add(24 * time.Hour)
-		if userInfo.ExpiresInSeconds != 0 {
-			if time.Duration(userInfo.ExpiresInSeconds)*time.Second <= 24*time.Hour {
-				expirationTime = time.Now().Add(time.Duration(userInfo.ExpiresInSeconds) * time.Second)
-			}
-		}
 
 		t := jwt.NewWithClaims(
 			jwt.SigningMethodHS256,
 			jwt.RegisteredClaims{
 				Issuer:    "chirpy",
 				IssuedAt:  jwt.NewNumericDate(time.Now().UTC()),
-				ExpiresAt: jwt.NewNumericDate(expirationTime),
+				ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
 				Subject:   string(dbUser.email),
 			})
 		s, err := t.SignedString([]byte(cfg.jwtSecret))
@@ -218,7 +216,20 @@ func (cfg *apiConfig) login(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		resp, err := json.Marshal(response{ID: dbUser.id, Email: dbUser.email, Token: s})
+		buf := make([]byte, 32)
+		_, err = rand.Read(buf)
+		if err != nil {
+			log.Printf("error generating random string: %v", err)
+			w.WriteHeader(500)
+			return
+		}
+		refreshToken := hex.EncodeToString(buf)
+
+		dbUser.refreshToken = refreshToken
+		dbUser.tokenExpiresAt = time.Now().Add((24 * time.Hour) * 60)
+		tempDB[userInfo.Email] = dbUser
+
+		resp, err := json.Marshal(response{ID: dbUser.id, Email: dbUser.email, Token: s, RefreshToken: refreshToken})
 		if err != nil {
 			log.Printf("Error marshalling response: %v", err)
 			w.WriteHeader(500)
