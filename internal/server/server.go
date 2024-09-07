@@ -5,12 +5,16 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
+	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/crypto/bcrypt"
 )
 
 type apiConfig struct {
 	fileServerHits int
+	jwtSecret      string
 }
 
 type requestBody struct {
@@ -18,6 +22,7 @@ type requestBody struct {
 }
 
 type user struct {
+	id       int
 	email    string
 	password []byte
 }
@@ -33,8 +38,9 @@ var Srv = &http.Server{
 }
 var tempDB = make(map[string]user)
 
-func Initialize() {
-	cfg := apiConfig{fileServerHits: 0}
+func Initialize(secret string) {
+	cfg := apiConfig{fileServerHits: 0, jwtSecret: secret}
+
 	mux.Handle("/app/", cfg.middlewareMetrics(http.StripPrefix("/app/", http.FileServer(http.Dir(root)))))
 	mux.HandleFunc("GET /api/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -50,7 +56,8 @@ func Initialize() {
 		w.Write([]byte(fmt.Sprintf("id: is %v", id)))
 	})
 	mux.HandleFunc("POST /api/users", users)
-	mux.HandleFunc("POST /api/login", login)
+	mux.HandleFunc("PUT /api/users", cfg.update)
+	mux.HandleFunc("POST /api/login", cfg.login)
 
 	fmt.Println("Serving on port: ", Port)
 	log.Fatal(Srv.ListenAndServe())
@@ -145,15 +152,16 @@ func users(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if _, exists := tempDB[userInfo.Email]; !exists {
-		tempDB[userInfo.Email] = user{email: userInfo.Email, password: hashedPassword}
+		tempDB[userInfo.Email] = user{id: len(tempDB) + 1, email: userInfo.Email, password: hashedPassword}
 
-		resp, err := json.Marshal(response{ID: 1, Email: userInfo.Email})
+		resp, err := json.Marshal(response{ID: tempDB[userInfo.Email].id, Email: userInfo.Email})
 		if err != nil {
 			log.Printf("Error marshalling JSON: %s", err)
 			w.WriteHeader(500)
 			return
 		}
 
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		w.Write(resp)
 	} else {
@@ -162,14 +170,16 @@ func users(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func login(w http.ResponseWriter, r *http.Request) {
+func (cfg *apiConfig) login(w http.ResponseWriter, r *http.Request) {
 	type requestBody struct {
-		Password string `json:"password"`
-		Email    string `json:"email"`
+		Password         string `json:"password"`
+		Email            string `json:"email"`
+		ExpiresInSeconds int    `json:"expires_in_seconds"`
 	}
 	type response struct {
 		ID    int    `json:"id"`
 		Email string `json:"email"`
+		Token string `json:"token"`
 	}
 	var userInfo requestBody
 
@@ -186,18 +196,93 @@ func login(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
+		expirationTime := time.Now().Add(24 * time.Hour)
+		if userInfo.ExpiresInSeconds != 0 {
+			if time.Duration(userInfo.ExpiresInSeconds)*time.Second <= 24*time.Hour {
+				expirationTime = time.Now().Add(time.Duration(userInfo.ExpiresInSeconds) * time.Second)
+			}
+		}
 
-		resp, err := json.Marshal(response{ID: 1, Email: dbUser.email})
+		t := jwt.NewWithClaims(
+			jwt.SigningMethodHS256,
+			jwt.RegisteredClaims{
+				Issuer:    "chirpy",
+				IssuedAt:  jwt.NewNumericDate(time.Now().UTC()),
+				ExpiresAt: jwt.NewNumericDate(expirationTime),
+				Subject:   string(dbUser.email),
+			})
+		s, err := t.SignedString([]byte(cfg.jwtSecret))
+		if err != nil {
+			log.Printf("error signing token: %v", err)
+			w.WriteHeader(500)
+			return
+		}
+
+		resp, err := json.Marshal(response{ID: dbUser.id, Email: dbUser.email, Token: s})
 		if err != nil {
 			log.Printf("Error marshalling response: %v", err)
 			w.WriteHeader(500)
 			return
 		}
-
+		w.Header().Set("Content-Type", "application/json")
 		w.Write(resp)
 
 	} else {
 		w.WriteHeader(http.StatusNoContent)
 		w.Write([]byte(fmt.Sprintf("No user found with the email: %s", userInfo.Email)))
+	}
+}
+
+func (cfg *apiConfig) update(w http.ResponseWriter, r *http.Request) {
+	type requestBody struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	type response struct {
+		ID    int    `json:"id"`
+		Email string `json:"email"`
+	}
+
+	authHeader := r.Header.Get("Authorization")
+	if len(authHeader) == 0 {
+		log.Println("No authorization header provided")
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	token := strings.Fields(authHeader)[1]
+	fmt.Println("token is: \n", token)
+	parsedToken, err := jwt.ParseWithClaims(token, &jwt.RegisteredClaims{}, func(t *jwt.Token) (interface{}, error) {
+		return []byte(cfg.jwtSecret), nil
+	})
+	if err != nil {
+		log.Printf("Error parsing token: %v", err)
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	userEmail, err := parsedToken.Claims.GetSubject()
+	if err != nil {
+		log.Printf("Error getting claims subject: %v", err)
+		w.WriteHeader(500)
+		return
+	}
+
+	var reqBody requestBody
+	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+		log.Printf("Error parsing request body: %v", err)
+		w.WriteHeader(500)
+		return
+	}
+
+	dbUser, exists := tempDB[userEmail]
+	if exists {
+		// in a normal app we would update the fields in the db -- I'll just send it back as is for now
+		resp, err := json.Marshal(response{ID: dbUser.id, Email: dbUser.email})
+		if err != nil {
+			log.Printf("Error marshaling response: %v", err)
+		}
+
+		w.Write(resp)
 	}
 }
