@@ -62,6 +62,7 @@ func Initialize(secret string) {
 	mux.HandleFunc("POST /api/users", users)
 	mux.HandleFunc("PUT /api/users", cfg.update)
 	mux.HandleFunc("POST /api/login", cfg.login)
+	mux.HandleFunc("POST /api/refresh", cfg.refresh)
 
 	fmt.Println("Serving on port: ", Port)
 	log.Fatal(Srv.ListenAndServe())
@@ -262,7 +263,6 @@ func (cfg *apiConfig) update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	token := strings.Fields(authHeader)[1]
-	fmt.Println("token is: \n", token)
 	parsedToken, err := jwt.ParseWithClaims(token, &jwt.RegisteredClaims{}, func(t *jwt.Token) (interface{}, error) {
 		return []byte(cfg.jwtSecret), nil
 	})
@@ -295,5 +295,53 @@ func (cfg *apiConfig) update(w http.ResponseWriter, r *http.Request) {
 		}
 
 		w.Write(resp)
+	}
+}
+
+func (cfg *apiConfig) refresh(w http.ResponseWriter, r *http.Request) {
+	type response struct {
+		Token string `json:"token"`
+	}
+
+	authHeader := r.Header.Get("Authorization")
+	if len(authHeader) == 0 {
+		log.Println("No authorization header provided")
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	token := strings.Fields(authHeader)[1]
+
+	for _, user := range tempDB {
+		if user.refreshToken == token && time.Since(user.tokenExpiresAt) < ((time.Hour*24)*60) {
+			t := jwt.NewWithClaims(
+				jwt.SigningMethodHS256,
+				jwt.RegisteredClaims{
+					Issuer:    "chirpy",
+					IssuedAt:  jwt.NewNumericDate(time.Now().UTC()),
+					ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+					Subject:   string(user.email),
+				},
+			)
+			s, err := t.SignedString([]byte(cfg.jwtSecret))
+			if err != nil {
+				log.Printf("error signing token: %v", err)
+				w.WriteHeader(500)
+				return
+			}
+
+			resp, err := json.Marshal(response{Token: s})
+			if err != nil {
+				log.Printf("Error marshalling response: %v", err)
+				w.WriteHeader(500)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(resp)
+			break
+		} else {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
 	}
 }
