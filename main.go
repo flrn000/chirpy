@@ -16,4 +16,6 @@ func main() {
 
 	secret := os.Getenv("JWT_SECRET")
 	server.Initialize(secret)
+
+	"am modificat ceva"
 }
